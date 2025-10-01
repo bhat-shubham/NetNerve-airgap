@@ -126,7 +126,7 @@ export const FileUpload = ({ onChange, setIsProcessed, isProcessed , setFile , s
       // axios request that handles both upload progress and processing
       const response = await axios({
         method: 'post',
-        url: 'https://netnerve.onrender.com/uploadfile/',
+        url: 'http://127.0.0.1:8000/uploadfile/',
         data: formData,
         signal: controller.signal,
         onUploadProgress: (axiosProgressEvent) => {
