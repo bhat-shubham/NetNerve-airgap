@@ -87,7 +87,7 @@ export const FileUpload = ({ onChange, setIsProcessed, isProcessed , setFile , s
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const generateSummary = async (protocols: string[], packet_data: any[], total_data_size: number[]) => {
     try {
-      const summaryRes = await fetch("https://netnerve.onrender.com/generate-summary/", {
+      const summaryRes = await fetch("http://127.0.0.1:8000/generate-summary/", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

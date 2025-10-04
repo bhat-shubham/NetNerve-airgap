@@ -8,6 +8,8 @@ import uuid,os,datetime
 from dotenv import load_dotenv
 from fastapi.staticfiles import StaticFiles
 from fastapi import Body
+from llama_cpp import Llama
+
 # import magic
 import filetype
 load_dotenv()
@@ -130,17 +132,44 @@ def build_summary_prompt(protocols, packet_data, total_data_size):
 
 async def generate_ai_summary(protocols, packet_data, total_data_size):
     user_prompt = build_summary_prompt(protocols, packet_data, total_data_size)
+    model_path = "models/gemma-2-2b-it-Q4_K_M.gguf"
+    if not os.path.exists(model_path):
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Model file not found at {model_path}"
+        )
+    llm = Llama(
+    model_path="models/gemma-2-2b-it-Q4_K_M.gguf",
+    n_ctx=1024,        # Context size
+    n_threads=6,
+    n_batch=128,       # Adjust to your CPU cores
+)
+    output = llm(user_prompt, max_tokens=200, stop=["</s>"], stream=False)
+    if isinstance(output, dict):
+        choices = output.get("choices")
+        if choices and isinstance(choices, list):
+            first = choices[0]
+            text = first.get("text") or first.get("message", {}).get("content")
+        else:
+            text = output.get("text") or output.get("output")
+    else:
+        text = str(output)
 
-    chat = client.chat.completions.create(
-        model="llama-3.3-70b-versatile", #other are "llama-3.3-70b-instruct", "llama-3.3-70b-chat"
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ]
-    )
+    print(text.strip() if isinstance(text, str) else text)
+    return text
 
-    summary_text=chat.choices[0].message.content
-    return{summary_text}
+
+    # chat = client.chat.completions.create(
+    #     model="llama-3.3-70b-versatile", #other are "llama-3.3-70b-instruct", "llama-3.3-70b-chat"
+    #     messages=[
+    #         {"role": "system", "content": system_prompt},
+    #         {"role": "user", "content": user_prompt}
+    #     ]
+    # )
+
+    # summary_text=chat.choices[0].message.content
+    
+    # return{summary_text}
 
 @app.post("/generate-summary/")
 async def generate_summary(
@@ -149,7 +178,11 @@ async def generate_summary(
     total_data_size: int = Body(...)
 ):
     try:
-        summary =await generate_ai_summary(protocols, packet_data, total_data_size)
+        summary = await generate_ai_summary(protocols, packet_data, total_data_size)
         return {"summary": summary}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"AI Summary failed")
+        print(f"Error generating summary: {str(e)}")  # Log the error
+        raise HTTPException(
+            status_code=500, 
+            detail=f"AI Summary failed: {str(e)}"
+        )
