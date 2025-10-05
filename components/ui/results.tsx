@@ -22,7 +22,6 @@ type ResultPageProps = {
   protocols: string[];
   packetData: Packet[];
   summary: string;
-  // uploadData: unknown;
   totalDataSize : number[];
 
 
@@ -30,6 +29,7 @@ type ResultPageProps = {
 };
 const ResultPage = ({file , protocols , packetData, totalDataSize , summary,}: ResultPageProps) => {
     const fileName = file?.name ?? "No file uploaded yet";
+    console.log("summary:", summary);
     const fileSize = file ? `${(file.size / 1024).toFixed(2)} KB` : "N/A";
 
 const timestamps = packetData
@@ -84,18 +84,19 @@ const endTime = Math.max(...timestamps.map(ts => ts.getTime()));
     animate={{ opacity: 1 }}
     transition={{ duration: 1,delay:1, ease: "easeInOut" }}
     >
-      
+      {/* {summary} */}
       <MarkdownPreview 
       source={summary}
       style={{
-      backgroundColor: "transparent",
-      font:"bold",
-      // color: "#fff", // or "inherit"
-      // padding: "1rem",
-      // height:80
-      fontFamily:"Poppins",
-      fontWeight:900
-  }}
+        backgroundColor: "transparent",
+        color: "#fff",
+        fontFamily: "Poppins",
+        fontSize: "1rem",
+        lineHeight: "1.6",
+        padding: "1rem",
+      }}
+      rehypePlugins={[]}
+      remarkPlugins={[]}
       />
   </motion.p>
 </div>

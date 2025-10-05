@@ -144,19 +144,14 @@ async def generate_ai_summary(protocols, packet_data, total_data_size):
     n_threads=6,
     n_batch=128,       # Adjust to your CPU cores
 )
-    output = llm(user_prompt, max_tokens=200, stop=["</s>"], stream=False)
+    output = llm(user_prompt, max_tokens=500, stop=["</s>"], stream=False)
     if isinstance(output, dict):
-        choices = output.get("choices")
-        if choices and isinstance(choices, list):
-            first = choices[0]
-            text = first.get("text") or first.get("message", {}).get("content")
-        else:
-            text = output.get("text") or output.get("output")
+        text = output.get("choices", [{}])[0].get("text", "")
     else:
         text = str(output)
 
-    print(text.strip() if isinstance(text, str) else text)
-    return text
+    print("Generated summary:", text)
+    return {text}
 
 
     # chat = client.chat.completions.create(
@@ -179,7 +174,8 @@ async def generate_summary(
 ):
     try:
         summary = await generate_ai_summary(protocols, packet_data, total_data_size)
-        return {"summary": summary}
+        print("Returning summary:", summary)
+        return {"summary": summary if summary else "No summary generated"}
     except Exception as e:
         print(f"Error generating summary: {str(e)}")  # Log the error
         raise HTTPException(
