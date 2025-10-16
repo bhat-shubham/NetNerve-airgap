@@ -1,92 +1,81 @@
-from typing import Annotated
+from typing import Annotated, List
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile, Body
+from fastapi.staticfiles import StaticFiles
 from scapy.all import rdpcap
 from scapy.layers.inet import IP, TCP, UDP, ICMP
 from scapy.layers.l2 import ARP
-import uuid,os,datetime
 from dotenv import load_dotenv
-from fastapi.staticfiles import StaticFiles
-from fastapi import Body
+import asyncio, base64, uuid, os, datetime, re, multiprocessing, tempfile
 from llama_cpp import Llama
 
-# import magic
-import filetype
 load_dotenv()
-from groq import Groq
-timestamp = datetime.datetime.now().isoformat()
-app = FastAPI()
+
+app = FastAPI(title="NetNerve Optimized Backend")
+
+# Serving frontend
 if os.path.isdir("static"):
     app.mount("/", StaticFiles(directory="static", html=True), name="static")
 
-
-
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["POST","OPTIONS"],
+    allow_methods=["POST", "OPTIONS", "GET"],
     allow_headers=["Content-Type"],
 )
+
 @app.get("/")
 async def root():
-    return {"message": "NetNerve backend is live!"}
+    return {"message": "NetNerve optimized backend is live!"}
+# PCAP Parsing
+
 def extract_packet_data(file_path):
     packets = rdpcap(file_path)
     data = []
-
     for pkt in packets:
         pkt_info = {}
-
         if IP in pkt:
             pkt_info["src_ip"] = pkt[IP].src
             pkt_info["dst_ip"] = pkt[IP].dst
             pkt_info["packet_len"] = len(pkt)
             pkt_info["timestamp"] = pkt.time
-
             if TCP in pkt:
                 pkt_info["protocol"] = "TCP"
                 pkt_info["src_port"] = pkt[TCP].sport
                 pkt_info["dst_port"] = pkt[TCP].dport
                 pkt_info["flags"] = str(pkt[TCP].flags)
-
             elif UDP in pkt:
                 pkt_info["protocol"] = "UDP"
                 pkt_info["src_port"] = pkt[UDP].sport
                 pkt_info["dst_port"] = pkt[UDP].dport
-
             elif ICMP in pkt:
                 pkt_info["protocol"] = "ICMP"
-
         elif ARP in pkt:
             pkt_info["protocol"] = "ARP"
-
         if pkt_info:
             data.append(pkt_info)
-
     return data
-
-# @app.post("/files/")
-# async def create_file(file: Annotated[bytes, File()]):
-#     return {"file_size": len(file)}
 
 
 @app.post("/uploadfile/")
 async def create_upload_file(file: UploadFile):
-    MAX_FILE_SIZE_MB = 2
+    MAX_FILE_SIZE_MB = int(os.environ.get("MAX_UPLOAD_MB", "10"))
     valid_extensions = [".pcap", ".cap"]
+
     if not (file.filename and file.filename.lower().endswith(tuple(valid_extensions))):
         raise HTTPException(status_code=400, detail="Invalid file extension.")
-    file_head = await file.read(2048)
-    file_path = f"{uuid.uuid4()}.pcap"
-    # kind = filetype.guess(file_path)
-    # print(f"File type detected: {kind}")
-    content = file_head + await file.read()
-    if(len(content) > MAX_FILE_SIZE_MB * 1024 * 1024):
-        raise HTTPException(status_code=400, detail="File size exceeds the limit of 5MB.")
+
+    content = await file.read()
+    if len(content) > MAX_FILE_SIZE_MB * 1024 * 1024:
+        raise HTTPException(status_code=400, detail=f"File too large. Max {MAX_FILE_SIZE_MB} MB allowed.")
+
+    tmp_dir = tempfile.gettempdir()
+    file_path = os.path.join(tmp_dir, f"{uuid.uuid4()}.pcap")
     with open(file_path, "wb") as f:
         f.write(content)
-    packets = None
+
     try:
         packets = rdpcap(file_path)
         protocols = set()
@@ -94,91 +83,223 @@ async def create_upload_file(file: UploadFile):
             layer = packet
             while layer:
                 protocols.add(layer.__class__.__name__)
-                layer = layer.payload  # move to next inner layer
+                layer = layer.payload
         packet_data = extract_packet_data(file_path)
-        total_data_size = sum(pkt.get('packet_len', 0) for pkt in packet_data)
-        result = {
+        total_data_size = sum(pkt.get("packet_len", 0) for pkt in packet_data)
+        return {
             "protocols": list(protocols),
             "packet_data": packet_data,
-            "total_data_size": total_data_size
+            "total_data_size": total_data_size,
         }
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid or corrupted pcap file: {e}")
+        raise HTTPException(status_code=400, detail=f"Corrupted pcap file: {e}")
     finally:
-        os.remove(file_path)  # Clean up the temporary file after processing
-    return result
-client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+        os.remove(file_path)
 
 
-system_prompt = os.environ.get("SYSTEM_PROMPT") or "You are a cybersecurity expert."
-def build_summary_prompt(protocols, packet_data, total_data_size):
-    lines = []
-    lines.append(f"Protocols used: {', '.join(protocols)}.")
-    lines.append(f"Total packets captured: {len(packet_data)}.")
-    lines.append(f"Total data transferred: {total_data_size} bytes.")
+#pooled model setup
 
-    if packet_data:
-        sample = packet_data[:5]  # First 5 packets
-        for i, pkt in enumerate(sample, 1):
-            lines.append(
-                f"Sample {i}: {pkt.get('src_ip')}:{pkt.get('src_port')} → "
-                f"{pkt.get('dst_ip')}:{pkt.get('dst_port')} | {pkt.get('protocol')} "
-                f"| Size: {pkt.get('packet_len')} bytes | Flags: {pkt.get('flags')}."
+MODEL_PATH = "models/Llama-3.2-3B.Q4_K_M.gguf"
+raw_system_prompt = os.environ.get("SYSTEM_PROMPT", "")
+system_prompt = raw_system_prompt.strip().strip('"').strip("\n")
+MODEL_POOL_SIZE = int(os.environ.get("MODEL_POOL_SIZE", "1"))
+MODEL_N_CTX = int(os.environ.get("MODEL_N_CTX", "2048"))
+MODEL_MAX_TOKENS = int(os.environ.get("MODEL_MAX_TOKENS", "2000"))
+
+model_pool: List[Llama] = []
+model_pool_lock = asyncio.Lock()
+model_semaphore = None
+
+
+@app.on_event("startup")
+def load_llm_at_startup():
+    """Initialize a small model pool at startup"""
+    global model_pool, model_semaphore
+
+    if not os.path.exists(MODEL_PATH):
+        print(f"⚠️ Model not found at {MODEL_PATH}")
+        return
+
+    cpu_count = max(1, multiprocessing.cpu_count())
+    suggested_pool = 1 if cpu_count < 8 else min(2, cpu_count // 8)
+    pool_size = min(MODEL_POOL_SIZE, suggested_pool) if MODEL_POOL_SIZE else suggested_pool
+    model_semaphore = asyncio.Semaphore(pool_size)
+
+    print(f"🔹 Creating model pool with {pool_size} instances (cpu_count={cpu_count})")
+
+    for i in range(pool_size):
+        try:
+            threads_per_model = max(1, (cpu_count // pool_size) - 1)
+            m = Llama(
+                model_path=MODEL_PATH,
+                n_ctx=MODEL_N_CTX,
+                n_threads=min(threads_per_model, 10),
+                n_batch=128,
+                f16_kv=True,
+                use_mlock=True,
+                embedding=False,
             )
+            model_pool.append(m)
+            print(f"  ✅ Loaded model instance {i+1}/{pool_size} (threads={threads_per_model})")
+        except Exception as e:
+            print(f"  ❌ Failed to load model instance {i+1}: {e}")
 
-    lines.append("Based on this, analyze the data for potential threats, patterns, or observations.")
-    return "\n".join(lines)
-
-
-async def generate_ai_summary(protocols, packet_data, total_data_size):
-    user_prompt = build_summary_prompt(protocols, packet_data, total_data_size)
-    model_path = "models/gemma-2-2b-it-Q4_K_M.gguf"
-    if not os.path.exists(model_path):
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Model file not found at {model_path}"
-        )
-    llm = Llama(
-    model_path="models/gemma-2-2b-it-Q4_K_M.gguf",
-    n_ctx=1024,        # Context size
-    n_threads=6,
-    n_batch=128,       # Adjust to your CPU cores
-)
-    output = llm(user_prompt, max_tokens=500, stop=["</s>"], stream=False)
-    if isinstance(output, dict):
-        text = output.get("choices", [{}])[0].get("text", "")
-    else:
-        text = str(output)
-
-    print("Generated summary:", text)
-    return {text}
+    if not model_pool:
+        print("❌ No model instances loaded. LLM augmentation will be disabled.")
 
 
-    # chat = client.chat.completions.create(
-    #     model="llama-3.3-70b-versatile", #other are "llama-3.3-70b-instruct", "llama-3.3-70b-chat"
-    #     messages=[
-    #         {"role": "system", "content": system_prompt},
-    #         {"role": "user", "content": user_prompt}
-    #     ]
-    # )
+# prompt builders
+def build_summary_prompt(protocols, packet_data, total_data_size):
+    proto_counts = {}
+    src_counts = {}
+    dst_counts = {}
+    for pkt in packet_data:
+        proto = pkt.get("protocol", "Unknown")
+        proto_counts[proto] = proto_counts.get(proto, 0) + 1
+        src = pkt.get("src_ip")
+        dst = pkt.get("dst_ip")
+        if src:
+            src_counts[src] = src_counts.get(src, 0) + 1
+        if dst:
+            dst_counts[dst] = dst_counts.get(dst, 0) + 1
 
-    # summary_text=chat.choices[0].message.content
-    
-    # return{summary_text}
+    # split first 200 if too large
+    max_packets_to_show = 200 
+    if len(packet_data) > max_packets_to_show:
+        packet_data = packet_data[:max_packets_to_show]
 
+    summary_data = {
+        'total_packets': len(packet_data),
+        'sample_size': min(len(packet_data), max_packets_to_show),
+        'total_bytes': total_data_size,
+        'protocols': protocols[:30],
+        'protocol_stats': {k: v for k, v in proto_counts.items()},
+        'top_sources': [{'ip': k, 'count': v} for k, v in sorted(src_counts.items(), key=lambda x: x[1], reverse=True)[:10]],
+        'top_destinations': [{'ip': k, 'count': v} for k, v in sorted(dst_counts.items(), key=lambda x: x[1], reverse=True)[:10]]
+    }
+
+    parts = [
+        "Network Capture Statistics:",
+        f"- Total Packets Analyzed: {summary_data['total_packets']}",
+        f"- Data Volume: {summary_data['total_bytes']} bytes",
+        f"- Protocol Distribution: {', '.join(f'{k}: {v}' for k, v in summary_data['protocol_stats'].items())}",
+        "\nTop Communication Patterns:",
+        "- Source IPs: " + ', '.join(f"{ip['ip']} ({ip['count']} packets)" for ip in summary_data['top_sources'][:5]),
+        "- Destination IPs: " + ', '.join(f"{ip['ip']} ({ip['count']} packets)" for ip in summary_data['top_destinations'][:5]),
+        "\nNote: " + (f"Analysis limited to {max_packets_to_show} packets for processing efficiency." if len(packet_data) > max_packets_to_show else "Full capture analyzed.")
+    ]
+    return "\n".join(parts)
+
+# fallback deterministic sumary
+def generate_deterministic_summary(packet_data, protocols):
+    """Generate a deterministic summary for immediate response"""
+    sections = []
+    unique_src_ips = len(set(pkt.get("src_ip") for pkt in packet_data if "src_ip" in pkt))
+    unique_dst_ips = len(set(pkt.get("dst_ip") for pkt in packet_data if "dst_ip" in pkt))
+    sections.append("### Analysis Summary\n")
+    sections.append(f"Analyzed {len(packet_data)} packets across {len(protocols)} protocols. "
+                    f"Detected communication between {unique_src_ips} sources and {unique_dst_ips} destinations.")
+    return "\n".join(sections)
+
+
+# Model main Inference (pooled)
+async def run_llm_inference(prompt: str) -> str:
+    """Safely run inference using a pooled model with concurrency limits"""
+    if not model_pool:
+        raise HTTPException(status_code=503, detail="LLM not available")
+
+    await model_semaphore.acquire()
+    async with model_pool_lock:
+        model = model_pool.pop()
+
+    try:
+        def call_model():
+            try:
+                out = model.create_completion(
+                    prompt=prompt,
+                    max_tokens=2000,  
+                    temperature=0.2,  
+                    top_p=0.1,       
+                    repeat_penalty=1.15,  
+                    stop=["</s>", "User:", "\n\n\n"],
+                    stream=False,
+                )
+                if isinstance(out, dict):
+                    return out.get("choices", [{}])[0].get("text", "")
+                return str(out)
+            except Exception as e:
+                return f"[ERROR during inference] {e}"
+
+        text = await asyncio.to_thread(call_model)
+        if not text or text.startswith("[ERROR"):
+            raise HTTPException(status_code=500, detail=f"LLM error: {text}")
+        return text.strip()
+
+    finally:
+        async with model_pool_lock:
+            model_pool.append(model)
+        model_semaphore.release()
+
+# summary endpoint
 @app.post("/generate-summary/")
 async def generate_summary(
     protocols: list[str] = Body(...),
     packet_data: list[dict] = Body(...),
-    total_data_size: int = Body(...)
+    total_data_size: int = Body(...),
 ):
+    deterministic = generate_deterministic_summary(packet_data, protocols)
+
+    if os.environ.get("USE_LLM_AUGMENTATION", "1") != "1":
+        return {"summary": [deterministic], "status": "completed", "analysisType": "deterministic"}
+
+    response = {
+        "summary": [deterministic],
+        "status": "processing",
+        "analysisType": "deterministic",
+        "message": "Statistical analysis complete. AI-powered analysis is processing...",
+    }
+
+    user_prompt = build_summary_prompt(protocols, packet_data, total_data_size)
+    # Build a full prompt that includes the SYSTEM prompt from the environment (if provided)
+    # The system prompt is intended to guide the model's style, structure, and constraints.
+    system_header = (system_prompt + "\n\n") if system_prompt else ""
+
+    wrapper = """
+System: You are a SOC analyst generating a detailed traffic analysis report. Your output must follow this exact format:
+
+### Analysis Summary
+[2-3 sentences summarizing total packets, data volume, and key findings]
+
+### Protocol Insights
+[List each major protocol with packet counts and behavioral assessment]
+
+### Traffic Behavior
+[2-3 paragraphs on traffic patterns, anomalies, and session characteristics]
+
+### Potential Threat Indicators
+| Indicator | Description | Severity |
+|-----------|-------------|----------|
+[List anomalies with descriptions and severity (High/Medium/Low)]
+
+### Conclusion
+[1-2 sentences on security posture and recommendations]
+[Note if analysis was truncated]
+
+Here's the traffic data to analyze:
+
+"""
+
+    # system header + wrapper + user prompt
+    full_prompt = f"{system_header}\n{wrapper}\n{user_prompt}\n\nAnalyst: Generating comprehensive traffic analysis report:\n"
+
     try:
-        summary = await generate_ai_summary(protocols, packet_data, total_data_size)
-        print("Returning summary:", summary)
-        return {"summary": summary if summary else "No summary generated"}
-    except Exception as e:
-        print(f"Error generating summary: {str(e)}")  # Log the error
-        raise HTTPException(
-            status_code=500, 
-            detail=f"AI Summary failed: {str(e)}"
-        )
+        llm_summary = await run_llm_inference(full_prompt)
+        return {"summary": [llm_summary], "status": "completed", "analysisType": "ai", "message": "AI analysis complete"}
+    except HTTPException as e:
+        print(f"❌ LLM inference failed: {e.detail}")
+        return {
+            "summary": [deterministic],
+            "status": "error",
+            "analysisType": "deterministic",
+            "message": f"AI analysis failed: {e.detail}. Using deterministic fallback.",
+        }
