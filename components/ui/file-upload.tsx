@@ -101,8 +101,10 @@ export const FileUpload = ({ onChange, setIsProcessed, isProcessed , setFile , s
         throw new Error("Failed to generate summary");
       }
 
-      const summaryData = await summaryRes.json();
-      return summaryData.summary[0];
+  const summaryData = await summaryRes.json();
+  // backend may return summary as a string or an array with one string element
+  if (Array.isArray(summaryData.summary)) return summaryData.summary[0];
+  return summaryData.summary;
     } catch (error) {
       console.error("Error generating summary:", error);
       throw error;

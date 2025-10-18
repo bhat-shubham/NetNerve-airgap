@@ -1,23 +1,31 @@
 from typing import Annotated, List
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import FastAPI, File, HTTPException, UploadFile, Body
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi import FastAPI, File, HTTPException, UploadFile, Body, Request
 from fastapi.staticfiles import StaticFiles
 from scapy.all import rdpcap
 from scapy.layers.inet import IP, TCP, UDP, ICMP
 from scapy.layers.l2 import ARP
 from dotenv import load_dotenv
-import asyncio, base64, uuid, os, datetime, re, multiprocessing, tempfile
+import asyncio, base64, uuid, os, datetime, re, multiprocessing, tempfile, logging, traceback, time
 from llama_cpp import Llama
+from queue import Queue
+
+# setup logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 load_dotenv()
 
-app = FastAPI(title="NetNerve Optimized Backend")
+app = FastAPI(title="NetNerve Backend")
 
-# Serving frontend
+# gzip compression for large json responses
+app.add_middleware(GZipMiddleware, minimum_size=500)
+
+# serving frontend
 if os.path.isdir("static"):
     app.mount("/", StaticFiles(directory="static", html=True), name="static")
 
-# CORS
+# cors setup
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -28,11 +36,23 @@ app.add_middleware(
 
 @app.get("/")
 async def root():
-    return {"message": "NetNerve optimized backend is live!"}
-# PCAP Parsing
+    return {"status": "success", "message": "NetNerve optimized backend is live!"}
 
-def extract_packet_data(file_path):
-    packets = rdpcap(file_path)
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "success",
+        "model_loaded": bool(model_pool.qsize() > 0 if 'model_pool' in globals() else False),
+    }
+
+# pcap parsing
+async def extract_packet_data(file_path):
+    try:
+        packets = await asyncio.to_thread(rdpcap, file_path)
+    except Exception as e:
+        logging.error(f"failed to parse pcap: {e}")
+        raise HTTPException(status_code=400, detail="Error reading PCAP file")
+
     data = []
     for pkt in packets:
         pkt_info = {}
@@ -61,6 +81,7 @@ def extract_packet_data(file_path):
 
 @app.post("/uploadfile/")
 async def create_upload_file(file: UploadFile):
+    start_time = time.time()
     MAX_FILE_SIZE_MB = int(os.environ.get("MAX_UPLOAD_MB", "10"))
     valid_extensions = [".pcap", ".cap"]
 
@@ -77,28 +98,32 @@ async def create_upload_file(file: UploadFile):
         f.write(content)
 
     try:
-        packets = rdpcap(file_path)
+        packets = await asyncio.to_thread(rdpcap, file_path)
         protocols = set()
         for packet in packets:
             layer = packet
             while layer:
                 protocols.add(layer.__class__.__name__)
                 layer = layer.payload
-        packet_data = extract_packet_data(file_path)
+        packet_data = await extract_packet_data(file_path)
         total_data_size = sum(pkt.get("packet_len", 0) for pkt in packet_data)
+        processing_time = int((time.time() - start_time) * 1000)
         return {
+            "status": "success",
             "protocols": list(protocols),
             "packet_data": packet_data,
             "total_data_size": total_data_size,
+            "processing_time_ms": processing_time,
         }
     except Exception as e:
+        logging.error(f"pcap read error: {traceback.format_exc()}")
         raise HTTPException(status_code=400, detail=f"Corrupted pcap file: {e}")
     finally:
-        os.remove(file_path)
+        if os.path.exists(file_path):
+            os.remove(file_path)
 
 
-#pooled model setup
-
+# pooled model setup
 MODEL_PATH = "models/Llama-3.2-3B.Q4_K_M.gguf"
 raw_system_prompt = os.environ.get("SYSTEM_PROMPT", "")
 system_prompt = raw_system_prompt.strip().strip('"').strip("\n")
@@ -106,18 +131,17 @@ MODEL_POOL_SIZE = int(os.environ.get("MODEL_POOL_SIZE", "1"))
 MODEL_N_CTX = int(os.environ.get("MODEL_N_CTX", "2048"))
 MODEL_MAX_TOKENS = int(os.environ.get("MODEL_MAX_TOKENS", "2000"))
 
-model_pool: List[Llama] = []
+model_pool: Queue = Queue()
 model_pool_lock = asyncio.Lock()
 model_semaphore = None
 
 
 @app.on_event("startup")
 def load_llm_at_startup():
-    """Initialize a small model pool at startup"""
     global model_pool, model_semaphore
 
     if not os.path.exists(MODEL_PATH):
-        print(f"⚠️ Model not found at {MODEL_PATH}")
+        logging.warning(f"model not found at {MODEL_PATH}")
         return
 
     cpu_count = max(1, multiprocessing.cpu_count())
@@ -125,7 +149,7 @@ def load_llm_at_startup():
     pool_size = min(MODEL_POOL_SIZE, suggested_pool) if MODEL_POOL_SIZE else suggested_pool
     model_semaphore = asyncio.Semaphore(pool_size)
 
-    print(f"🔹 Creating model pool with {pool_size} instances (cpu_count={cpu_count})")
+    logging.info(f"creating model pool with {pool_size} instances (cpu_count={cpu_count})")
 
     for i in range(pool_size):
         try:
@@ -139,20 +163,18 @@ def load_llm_at_startup():
                 use_mlock=True,
                 embedding=False,
             )
-            model_pool.append(m)
-            print(f"  ✅ Loaded model instance {i+1}/{pool_size} (threads={threads_per_model})")
-        except Exception as e:
-            print(f"  ❌ Failed to load model instance {i+1}: {e}")
+            model_pool.put(m)
+            logging.info(f"loaded model instance {i+1}/{pool_size} (threads={threads_per_model})")
+        except Exception:
+            logging.exception(f"failed to load model instance {i+1}")
 
-    if not model_pool:
-        print("❌ No model instances loaded. LLM augmentation will be disabled.")
+    if model_pool.empty():
+        logging.error("no model instances loaded. llm augmentation disabled.")
 
 
 # prompt builders
 def build_summary_prompt(protocols, packet_data, total_data_size):
-    proto_counts = {}
-    src_counts = {}
-    dst_counts = {}
+    proto_counts, src_counts, dst_counts = {}, {}, {}
     for pkt in packet_data:
         proto = pkt.get("protocol", "Unknown")
         proto_counts[proto] = proto_counts.get(proto, 0) + 1
@@ -163,8 +185,7 @@ def build_summary_prompt(protocols, packet_data, total_data_size):
         if dst:
             dst_counts[dst] = dst_counts.get(dst, 0) + 1
 
-    # split first 200 if too large
-    max_packets_to_show = 200 
+    max_packets_to_show = 200
     if len(packet_data) > max_packets_to_show:
         packet_data = packet_data[:max_packets_to_show]
 
@@ -172,10 +193,10 @@ def build_summary_prompt(protocols, packet_data, total_data_size):
         'total_packets': len(packet_data),
         'sample_size': min(len(packet_data), max_packets_to_show),
         'total_bytes': total_data_size,
-        'protocols': protocols[:30],
-        'protocol_stats': {k: v for k, v in proto_counts.items()},
+        'protocols': protocols[:20],
+        'protocol_stats': proto_counts,
         'top_sources': [{'ip': k, 'count': v} for k, v in sorted(src_counts.items(), key=lambda x: x[1], reverse=True)[:10]],
-        'top_destinations': [{'ip': k, 'count': v} for k, v in sorted(dst_counts.items(), key=lambda x: x[1], reverse=True)[:10]]
+        'top_destinations': [{'ip': k, 'count': v} for k, v in sorted(dst_counts.items(), key=lambda x: x[1], reverse=True)[:10]],
     }
 
     parts = [
@@ -186,41 +207,38 @@ def build_summary_prompt(protocols, packet_data, total_data_size):
         "\nTop Communication Patterns:",
         "- Source IPs: " + ', '.join(f"{ip['ip']} ({ip['count']} packets)" for ip in summary_data['top_sources'][:5]),
         "- Destination IPs: " + ', '.join(f"{ip['ip']} ({ip['count']} packets)" for ip in summary_data['top_destinations'][:5]),
-        "\nNote: " + (f"Analysis limited to {max_packets_to_show} packets for processing efficiency." if len(packet_data) > max_packets_to_show else "Full capture analyzed.")
+        "\nNote: " + ("Analysis limited to 200 packets for processing efficiency." if len(packet_data) > max_packets_to_show else "Full capture analyzed."),
     ]
     return "\n".join(parts)
 
-# fallback deterministic sumary
+
+# fallback deterministic summary
 def generate_deterministic_summary(packet_data, protocols):
-    """Generate a deterministic summary for immediate response"""
-    sections = []
     unique_src_ips = len(set(pkt.get("src_ip") for pkt in packet_data if "src_ip" in pkt))
     unique_dst_ips = len(set(pkt.get("dst_ip") for pkt in packet_data if "dst_ip" in pkt))
-    sections.append("### Analysis Summary\n")
-    sections.append(f"Analyzed {len(packet_data)} packets across {len(protocols)} protocols. "
-                    f"Detected communication between {unique_src_ips} sources and {unique_dst_ips} destinations.")
-    return "\n".join(sections)
+    return f"### Analysis Summary\nAnalyzed {len(packet_data)} packets across {len(protocols)} protocols. Communication between {unique_src_ips} sources and {unique_dst_ips} destinations."
 
 
-# Model main Inference (pooled)
+# model main inference (pooled)
 async def run_llm_inference(prompt: str) -> str:
-    """Safely run inference using a pooled model with concurrency limits"""
-    if not model_pool:
+    if model_pool.empty():
         raise HTTPException(status_code=503, detail="LLM not available")
 
     await model_semaphore.acquire()
-    async with model_pool_lock:
-        model = model_pool.pop()
+    model = None
 
     try:
+        async with model_pool_lock:
+            model = model_pool.get_nowait()
+
         def call_model():
             try:
                 out = model.create_completion(
                     prompt=prompt,
-                    max_tokens=2000,  
-                    temperature=0.2,  
-                    top_p=0.1,       
-                    repeat_penalty=1.15,  
+                    max_tokens=MODEL_MAX_TOKENS,
+                    temperature=0.2,
+                    top_p=0.1,
+                    repeat_penalty=1.15,
                     stop=["</s>", "User:", "\n\n\n"],
                     stream=False,
                 )
@@ -235,10 +253,16 @@ async def run_llm_inference(prompt: str) -> str:
             raise HTTPException(status_code=500, detail=f"LLM error: {text}")
         return text.strip()
 
+    except Exception as e:
+        logging.exception("inference failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
     finally:
-        async with model_pool_lock:
-            model_pool.append(model)
+        if model:
+            async with model_pool_lock:
+                model_pool.put(model)
         model_semaphore.release()
+
 
 # summary endpoint
 @app.post("/generate-summary/")
@@ -247,21 +271,18 @@ async def generate_summary(
     packet_data: list[dict] = Body(...),
     total_data_size: int = Body(...),
 ):
+    start_time = time.time()
     deterministic = generate_deterministic_summary(packet_data, protocols)
 
     if os.environ.get("USE_LLM_AUGMENTATION", "1") != "1":
-        return {"summary": [deterministic], "status": "completed", "analysisType": "deterministic"}
-
-    response = {
-        "summary": [deterministic],
-        "status": "processing",
-        "analysisType": "deterministic",
-        "message": "Statistical analysis complete. AI-powered analysis is processing...",
-    }
+        return {
+            "status": "success",
+            "analysisType": "deterministic",
+            "summary": deterministic,
+            "processing_time_ms": int((time.time() - start_time) * 1000),
+        }
 
     user_prompt = build_summary_prompt(protocols, packet_data, total_data_size)
-    # Build a full prompt that includes the SYSTEM prompt from the environment (if provided)
-    # The system prompt is intended to guide the model's style, structure, and constraints.
     system_header = (system_prompt + "\n\n") if system_prompt else ""
 
     wrapper = """
@@ -286,20 +307,24 @@ System: You are a SOC analyst generating a detailed traffic analysis report. You
 [Note if analysis was truncated]
 
 Here's the traffic data to analyze:
-
 """
 
-    # system header + wrapper + user prompt
     full_prompt = f"{system_header}\n{wrapper}\n{user_prompt}\n\nAnalyst: Generating comprehensive traffic analysis report:\n"
 
     try:
         llm_summary = await run_llm_inference(full_prompt)
-        return {"summary": [llm_summary], "status": "completed", "analysisType": "ai", "message": "AI analysis complete"}
-    except HTTPException as e:
-        print(f"❌ LLM inference failed: {e.detail}")
         return {
-            "summary": [deterministic],
+            "status": "success",
+            "analysisType": "ai",
+            "summary": llm_summary,
+            "processing_time_ms": int((time.time() - start_time) * 1000),
+        }
+    except HTTPException as e:
+        logging.error(f"LLM inference failed: {e.detail}")
+        return {
             "status": "error",
             "analysisType": "deterministic",
+            "summary": deterministic,
             "message": f"AI analysis failed: {e.detail}. Using deterministic fallback.",
+            "processing_time_ms": int((time.time() - start_time) * 1000),
         }

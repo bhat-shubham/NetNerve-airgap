@@ -21,7 +21,7 @@ type ResultPageProps = {
   file: File | null;
   protocols: string[];
   packetData: Packet[];
-  summary: string;
+  summary: string | { summary: string };
   totalDataSize : number[];
 
 
@@ -30,7 +30,7 @@ type ResultPageProps = {
 const ResultPage = ({file , protocols , packetData, totalDataSize , summary,}: ResultPageProps) => {
     const fileName = file?.name ?? "No file uploaded yet";
     console.log("summary:", summary);
-    const fileSize = file ? `${(file.size / 1024).toFixed(2)} KB` : "N/A";
+    const fileSize = file ? `${(file.size / 1024).toFixed(10)} KB` : "N/A";
 
 const timestamps = packetData
   .map(pkt => pkt.timestamp)
@@ -86,7 +86,7 @@ const endTime = Math.max(...timestamps.map(ts => ts.getTime()));
     >
       {/* {summary} */}
       <MarkdownPreview 
-      source={summary}
+      source={typeof summary === 'object' ? summary.summary : summary}
       style={{
         backgroundColor: "transparent",
         color: "#fff",
